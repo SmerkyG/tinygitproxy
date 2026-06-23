@@ -38,7 +38,7 @@ esac
 
 case "$AGENT_ID" in
   ""|*/*|*\\*|.|..)
-    die "agent id must be a single path-safe name, for example: dan-agent"
+    die "agent id must be a single path-safe name, for example: my-agent"
     ;;
 esac
 
@@ -85,6 +85,15 @@ chmod 600 "$AUTHORIZED_KEYS"
 
 shell_quote() {
   printf "%q" "$1"
+}
+
+detect_host() {
+  if [[ -n "${PROXY_HOST:-}" ]]; then
+    printf '%s\n' "$PROXY_HOST"
+    return 0
+  fi
+
+  hostname -f 2>/dev/null || hostname
 }
 
 # --------------------------------------------------------------------
@@ -388,6 +397,11 @@ EOF
 mv "$tmp" "$AUTHORIZED_KEYS"
 chmod 600 "$AUTHORIZED_KEYS"
 
+SSH_USER="$(whoami)"
+SSH_HOST="$(detect_host)"
+AGENT_REMOTE_URL="$SSH_USER@$SSH_HOST:$REPO_NAME.git"
+EXAMPLE_BRANCH="agent/$AGENT_ID/my-branch"
+
 echo "Configured Git proxy repo:"
 echo "  $REPO_DIR"
 echo
@@ -405,10 +419,19 @@ if [[ -n "$DENY_BRANCH_GLOBS" ]]; then
   echo "  $DENY_BRANCH_GLOBS"
 fi
 echo
-echo "Agent remote URL:"
-echo "  $(whoami)@HOST:$REPO_NAME.git"
+echo "SSH endpoint:"
+echo "  User: $SSH_USER"
+echo "  Host: $SSH_HOST"
+echo "  Repo path: $REPO_NAME.git"
 echo
-echo "Agent examples:"
-echo "  git remote add handoff $(whoami)@HOST:$REPO_NAME.git"
+echo "Agent remote URL:"
+echo "  $AGENT_REMOTE_URL"
+echo
+echo "Agent commands:"
+echo "  git remote add handoff $AGENT_REMOTE_URL"
 echo "  git fetch handoff"
-echo "  git push handoff agent/$AGENT_ID/my-branch"
+echo "  git push handoff HEAD:$EXAMPLE_BRANCH"
+echo
+echo "Notes:"
+echo "  The agent must connect with the private key matching: $AGENT_KEY_FILE"
+echo "  Pushed branch names are checked against the allow/deny branch globs above."
