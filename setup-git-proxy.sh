@@ -1,11 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_NAME="${1:?Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <allow-ref-regex>}"
-ORIGIN_URL="${2:?Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <allow-ref-regex>}"
-AGENT_ID="${3:?Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <allow-ref-regex>}"
-AGENT_KEY_FILE="${4:?Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <allow-ref-regex>}"
-ALLOW_REF_REGEX="${5:?Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <allow-ref-regex>}"
+usage() {
+  echo "Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <allow-branch-globs> [deny-branch-globs]" >&2
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+if [[ $# -lt 5 || $# -gt 6 ]]; then
+  usage
+  exit 2
+fi
+
+REPO_NAME="$1"
+ORIGIN_URL="$2"
+AGENT_ID="$3"
+AGENT_KEY_FILE="$4"
+ALLOW_BRANCH_GLOBS="$5"
+DENY_BRANCH_GLOBS="${6:-}"
 
 BASE_DIR="${BASE_DIR:-$HOME/git-proxies}"
 BIN_DIR="${BIN_DIR:-$HOME/bin}"
@@ -14,6 +29,36 @@ AUTHORIZED_KEYS="$SSH_DIR/authorized_keys"
 
 REPO_DIR="$BASE_DIR/$REPO_NAME.git"
 WRAPPER="$BIN_DIR/git-proxy-shell"
+
+case "$REPO_NAME" in
+  ""|*/*|*\\*|.|..)
+    die "repo name must be a single directory name, for example: my-repo"
+    ;;
+esac
+
+case "$AGENT_ID" in
+  ""|*/*|*\\*|.|..)
+    die "agent id must be a single path-safe name, for example: dan-agent"
+    ;;
+esac
+
+if [[ ! -f "$AGENT_KEY_FILE" ]]; then
+  die "agent public key file does not exist: $AGENT_KEY_FILE"
+fi
+
+if [[ ! -r "$AGENT_KEY_FILE" ]]; then
+  die "agent public key file is not readable: $AGENT_KEY_FILE"
+fi
+
+AGENT_KEY="$(grep -vE '^[[:space:]]*(#|$)' "$AGENT_KEY_FILE" | head -n1)"
+
+if [[ -z "$AGENT_KEY" ]]; then
+  die "no public key found in $AGENT_KEY_FILE"
+fi
+
+if [[ -z "$ALLOW_BRANCH_GLOBS" ]]; then
+  die "allow-branch-globs must not be empty; use '*' to allow all branches"
+fi
 
 mkdir -p "$BASE_DIR" "$BIN_DIR" "$SSH_DIR"
 chmod 700 "$SSH_DIR"
@@ -125,13 +170,22 @@ git -C "$REPO_DIR" remote add origin "$ORIGIN_URL"
 
 # Initial/best-effort sync from origin into local branch refs.
 # This makes pulls from the proxy useful immediately.
-git -C "$REPO_DIR" fetch origin '+refs/heads/*:refs/heads/*' || true
+if ! GIT_TERMINAL_PROMPT=0 git -C "$REPO_DIR" fetch origin '+refs/heads/*:refs/heads/*'; then
+  cat >&2 <<EOF
+Warning: initial fetch from origin failed, so the proxy repo was created but not synced.
+  Origin: $ORIGIN_URL
+
+Check that this user can authenticate to the origin and that the repository exists.
+Continuing because pushes through the proxy may still be valid once origin access is fixed.
+EOF
+fi
 
 # --------------------------------------------------------------------
 # 3. Install/update per-repo, per-agent policy.
 # --------------------------------------------------------------------
 mkdir -p "$REPO_DIR/proxy-policy/agents/$AGENT_ID"
-printf '%s\n' "$ALLOW_REF_REGEX" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/ref-regex"
+printf '%s\n' "$ALLOW_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-branch-globs"
+printf '%s\n' "$DENY_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-branch-globs"
 
 # --------------------------------------------------------------------
 # 4. Install/update pre-receive hook.
@@ -148,29 +202,103 @@ if [[ -z "$AGENT_ID" ]]; then
 fi
 
 REPO_DIR="$(pwd)"
-POLICY_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/ref-regex"
+ALLOW_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-branch-globs"
+DENY_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-branch-globs"
+LEGACY_ALLOW_REGEX_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-ref-regex"
+LEGACY_DENY_REGEX_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-ref-regex"
+LEGACY_REF_REGEX_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/ref-regex"
 
-if [[ ! -f "$POLICY_FILE" ]]; then
+trim_space() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+glob_list_matches() {
+  local value="$1"
+  local glob_list="$2"
+  local glob
+
+  IFS=',' read -r -a globs <<< "$glob_list"
+
+  for glob in "${globs[@]}"; do
+    glob="$(trim_space "$glob")"
+    [[ -z "$glob" ]] && continue
+
+    case "$value" in
+      $glob) return 0 ;;
+    esac
+  done
+
+  return 1
+}
+
+POLICY_MODE="glob"
+ALLOW_BRANCH_GLOBS=""
+DENY_BRANCH_GLOBS=""
+ALLOW_REF_REGEX=""
+DENY_REF_REGEX=""
+
+if [[ -f "$ALLOW_GLOBS_FILE" ]]; then
+  ALLOW_BRANCH_GLOBS="$(cat "$ALLOW_GLOBS_FILE")"
+
+  if [[ -f "$DENY_GLOBS_FILE" ]]; then
+    DENY_BRANCH_GLOBS="$(cat "$DENY_GLOBS_FILE")"
+  fi
+elif [[ -f "$LEGACY_ALLOW_REGEX_FILE" || -f "$LEGACY_REF_REGEX_FILE" ]]; then
+  POLICY_MODE="regex"
+  if [[ -f "$LEGACY_ALLOW_REGEX_FILE" ]]; then
+    ALLOW_REF_REGEX="$(cat "$LEGACY_ALLOW_REGEX_FILE")"
+  else
+    ALLOW_REF_REGEX="$(cat "$LEGACY_REF_REGEX_FILE")"
+  fi
+
+  if [[ -f "$LEGACY_DENY_REGEX_FILE" ]]; then
+    DENY_REF_REGEX="$(cat "$LEGACY_DENY_REGEX_FILE")"
+  fi
+else
   echo "No policy for agent: $AGENT_ID" >&2
   exit 1
 fi
 
-ALLOW_REF_REGEX="$(cat "$POLICY_FILE")"
 zero="0000000000000000000000000000000000000000"
 
 while read -r old new ref; do
   case "$ref" in
-    refs/heads/*) ;;
+    refs/heads/*)
+      branch="${ref#refs/heads/}"
+      ;;
     *)
       echo "Rejected: only branch refs are allowed: $ref" >&2
       exit 1
       ;;
   esac
 
-  if [[ ! "$ref" =~ $ALLOW_REF_REGEX ]]; then
-    echo "Rejected: agent '$AGENT_ID' may not update ref: $ref" >&2
-    echo "Allowed pattern: $ALLOW_REF_REGEX" >&2
-    exit 1
+  if [[ "$POLICY_MODE" == "glob" ]]; then
+    if [[ -n "$DENY_BRANCH_GLOBS" ]] && glob_list_matches "$branch" "$DENY_BRANCH_GLOBS"; then
+      echo "Rejected: agent '$AGENT_ID' may not update denied branch: $branch" >&2
+      echo "Denied branch globs: $DENY_BRANCH_GLOBS" >&2
+      exit 1
+    fi
+
+    if ! glob_list_matches "$branch" "$ALLOW_BRANCH_GLOBS"; then
+      echo "Rejected: agent '$AGENT_ID' may not update branch: $branch" >&2
+      echo "Allowed branch globs: $ALLOW_BRANCH_GLOBS" >&2
+      exit 1
+    fi
+  else
+    if [[ -n "$DENY_REF_REGEX" && "$ref" =~ $DENY_REF_REGEX ]]; then
+      echo "Rejected: agent '$AGENT_ID' may not update denied ref: $ref" >&2
+      echo "Denied pattern: $DENY_REF_REGEX" >&2
+      exit 1
+    fi
+
+    if [[ ! "$ref" =~ $ALLOW_REF_REGEX ]]; then
+      echo "Rejected: agent '$AGENT_ID' may not update ref: $ref" >&2
+      echo "Allowed pattern: $ALLOW_REF_REGEX" >&2
+      exit 1
+    fi
   fi
 
   if [[ "$new" == "$zero" ]]; then
@@ -213,13 +341,6 @@ chmod +x "$REPO_DIR/hooks/post-receive"
 #    This is scoped by AGENT_ID, so rerunning for another repo with
 #    the same agent updates the same agent block, not all proxy blocks.
 # --------------------------------------------------------------------
-AGENT_KEY="$(grep -vE '^[[:space:]]*(#|$)' "$AGENT_KEY_FILE" | head -n1)"
-
-if [[ -z "$AGENT_KEY" ]]; then
-  echo "No public key found in $AGENT_KEY_FILE" >&2
-  exit 1
-fi
-
 START_MARKER="# git-proxy-agent:$AGENT_ID start"
 END_MARKER="# git-proxy-agent:$AGENT_ID end"
 
@@ -253,8 +374,13 @@ echo
 echo "Agent:"
 echo "  $AGENT_ID"
 echo
-echo "Allowed pushed refs:"
-echo "  $ALLOW_REF_REGEX"
+echo "Allowed pushed branches:"
+echo "  $ALLOW_BRANCH_GLOBS"
+if [[ -n "$DENY_BRANCH_GLOBS" ]]; then
+  echo
+  echo "Denied pushed branches:"
+  echo "  $DENY_BRANCH_GLOBS"
+fi
 echo
 echo "Agent remote URL:"
 echo "  $(whoami)@HOST:$REPO_NAME.git"
