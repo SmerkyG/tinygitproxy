@@ -212,6 +212,8 @@ The proxy was not fully configured. Fix origin access and rerun setup."
   fi
 fi
 
+SYNCED_BRANCHES="$(git -C "$REPO_DIR" for-each-ref --format='%(refname:short)' refs/heads)"
+
 # --------------------------------------------------------------------
 # 3. Install/update per-repo, per-agent policy.
 # --------------------------------------------------------------------
@@ -408,6 +410,15 @@ echo
 echo "Forwarding origin:"
 echo "  $ORIGIN_URL"
 echo
+echo "Branches currently available through proxy:"
+if [[ -n "$SYNCED_BRANCHES" ]]; then
+  while IFS= read -r branch; do
+    echo "  $branch"
+  done <<< "$SYNCED_BRANCHES"
+else
+  echo "  (none)"
+fi
+echo
 echo "Agent:"
 echo "  $AGENT_ID"
 echo
@@ -427,11 +438,14 @@ echo
 echo "Agent remote URL:"
 echo "  $AGENT_REMOTE_URL"
 echo
-echo "Agent commands:"
-echo "  git remote add handoff $AGENT_REMOTE_URL"
-echo "  git fetch handoff"
-echo "  git push handoff HEAD:$EXAMPLE_BRANCH"
+echo "Agent clone command:"
+echo "  git clone $AGENT_REMOTE_URL"
+echo "  git clone --branch <branch> $AGENT_REMOTE_URL"
+echo
+echo "Agent push example:"
+echo "  git push origin HEAD:$EXAMPLE_BRANCH"
 echo
 echo "Notes:"
 echo "  The agent must connect with the private key matching: $AGENT_KEY_FILE"
+echo "  Cloning from the proxy makes it the clone's origin, so normal git pull/fetch behavior works through the proxy."
 echo "  Pushed branch names are checked against the allow/deny branch globs above."
