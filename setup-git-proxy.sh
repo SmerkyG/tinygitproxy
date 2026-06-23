@@ -60,6 +60,24 @@ if [[ -z "$ALLOW_BRANCH_GLOBS" ]]; then
   die "allow-branch-globs must not be empty; use '*' to allow all branches"
 fi
 
+check_origin() {
+  GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$ORIGIN_URL" >/dev/null
+}
+
+if ! check_origin; then
+  if [[ "${ALLOW_UNREACHABLE_ORIGIN:-}" == "1" ]]; then
+    cat >&2 <<EOF
+Warning: origin could not be reached, but ALLOW_UNREACHABLE_ORIGIN=1 is set.
+  Origin: $ORIGIN_URL
+
+The proxy will be configured without verifying that fetches and forwarded pushes can reach origin.
+EOF
+  else
+    die "origin could not be reached or authenticated: $ORIGIN_URL
+Fix this user's SSH access to origin, verify the repository exists, or rerun with ALLOW_UNREACHABLE_ORIGIN=1 to configure anyway."
+  fi
+fi
+
 mkdir -p "$BASE_DIR" "$BIN_DIR" "$SSH_DIR"
 chmod 700 "$SSH_DIR"
 touch "$AUTHORIZED_KEYS"
@@ -168,16 +186,21 @@ fi
 git -C "$REPO_DIR" remote remove origin 2>/dev/null || true
 git -C "$REPO_DIR" remote add origin "$ORIGIN_URL"
 
-# Initial/best-effort sync from origin into local branch refs.
+# Initial sync from origin into local branch refs.
 # This makes pulls from the proxy useful immediately.
 if ! GIT_TERMINAL_PROMPT=0 git -C "$REPO_DIR" fetch origin '+refs/heads/*:refs/heads/*'; then
-  cat >&2 <<EOF
-Warning: initial fetch from origin failed, so the proxy repo was created but not synced.
+  if [[ "${ALLOW_UNREACHABLE_ORIGIN:-}" == "1" ]]; then
+    cat >&2 <<EOF
+Warning: initial fetch from origin failed, so the proxy repo was not synced.
   Origin: $ORIGIN_URL
 
 Check that this user can authenticate to the origin and that the repository exists.
 Continuing because pushes through the proxy may still be valid once origin access is fixed.
 EOF
+  else
+    die "initial fetch from origin failed: $ORIGIN_URL
+The proxy was not fully configured. Fix origin access and rerun setup."
+  fi
 fi
 
 # --------------------------------------------------------------------
