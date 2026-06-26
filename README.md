@@ -20,8 +20,10 @@ bash setup-git-proxy.sh \
   <origin-url> \
   <agent-id> \
   <agent-public-key-file> \
-  <allow-branch-globs> \
-  [deny-branch-globs]
+  <push-allow-branch-globs> \
+  [push-deny-branch-globs] \
+  [pull-allow-branch-globs] \
+  [pull-deny-branch-globs]
 ```
 
 Example:
@@ -31,8 +33,9 @@ bash setup-git-proxy.sh repo-name \
   git@github.com:GITHUB-USERNAME/repo-name.git \
   my-agent \
   ~/my-agent.pub \
-  '*' \
-  'main,master'
+  'agents/my-agent/*' \
+  '' \
+  '*'
 ```
 
 By default, setup verifies that the current SSH user can read the origin with `git ls-remote --heads`. If origin auth is not ready but you still want to install the proxy files, opt in explicitly:
@@ -55,11 +58,11 @@ Examples:
 
 ```bash
 # Same repo, two different agents.
-bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git alice-agent ~/alice.pub 'agent/alice-agent/*' 'main,master'
-bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git bob-agent ~/bob.pub 'agent/bob-agent/*' 'main,master'
+bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git alice-agent ~/alice.pub 'agent/alice-agent/*' '' '*'
+bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git bob-agent ~/bob.pub 'agent/bob-agent/*' '' '*'
 
 # Same agent, another repo.
-bash setup-git-proxy.sh other-repo git@github.com:ORG/other-repo.git alice-agent ~/alice.pub 'agent/alice-agent/*' 'main,master'
+bash setup-git-proxy.sh other-repo git@github.com:ORG/other-repo.git alice-agent ~/alice.pub 'agent/alice-agent/*' '' '*'
 ```
 
 For each agent id, setup maintains one marked block in `authorized_keys`. For each repo, it stores policy under:
@@ -70,18 +73,26 @@ $BASE_DIR/<repo-name>.git/proxy-policy/agents/<agent-id>/
 
 ## Branch Policies
 
-Policies use comma-separated branch globs, not regular expressions. They match branch names such as `main` or `agent/my-agent/work`, not full refs such as `refs/heads/main`.
+Policies use comma-separated branch globs, not regular expressions. They match branch names such as `main` or `agents/my-agent/work`, not full refs such as `refs/heads/main`.
+
+Pull/clone and push policies are separate. If pull globs are omitted, pull/clone defaults to `*`. A common agent policy is:
+
+```bash
+bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git my-agent ~/my-agent.pub 'agents/my-agent/*' '' '*'
+```
+
+That allows the agent to clone and pull every branch, but only push branches under `agents/my-agent/`.
 
 Common examples:
 
 ```text
 *                         allow every branch
-agent/my-agent/*          allow only one agent namespace
+agents/my-agent/*         allow only one agent namespace
 main,master                deny exact branches
 release/*,stable           deny release branches and stable
 ```
 
-Deny globs win over allow globs. The proxy only accepts branch refs; tags and other non-branch refs are rejected.
+Deny globs win over allow globs within the same policy. The proxy only accepts branch refs for pushes; tags and other non-branch refs are rejected.
 
 ## Cloning Through The Proxy
 
@@ -106,12 +117,12 @@ git clone --branch dev git@example-host:repo-name.git
 
 This makes the proxy the clone's `origin`, so ordinary Git behavior works as expected. `git fetch`, `git pull`, and branch upstream tracking all go through the proxy.
 
-Setup prints the branch names currently available through the proxy. If a branch exists on the real upstream repository but is not listed by setup or by `git fetch origin` from a proxy clone, the proxy has not seen that branch from its own upstream credentials yet. Rerun setup after confirming the dedicated proxy user can see the branch on origin.
+Setup prints the branch names currently synced into the proxy. If a branch exists on the real upstream repository but is not listed by setup or by `git fetch origin` from a proxy clone, the proxy has not seen that branch from its own upstream credentials yet. Rerun setup after confirming the dedicated proxy user can see the branch on origin.
 
 If a branch only exists locally in an agent's working clone, publish it to an allowed branch through the proxy:
 
 ```bash
-git push -u origin HEAD:agent/my-agent/dev
+git push -u origin HEAD:agents/my-agent/dev
 ```
 
 That creates the remote branch and sets the local branch's upstream to it.
@@ -119,7 +130,7 @@ That creates the remote branch and sets the local branch's upstream to it.
 Push the current commit to an allowed branch name on `origin`:
 
 ```bash
-git push origin HEAD:agent/my-agent/my-branch
+git push origin HEAD:agents/my-agent/my-branch
 ```
 
 If the push passes the proxy policy, the proxy forwards that update to the upstream origin configured during setup. In effect, a successful push to the clone's `origin` becomes a push to the real upstream repository, but only after the proxy rejects disallowed branch names, non-branch refs, branch deletion, and non-fast-forward history rewrites.
@@ -172,7 +183,7 @@ or push your current branch to an allowed agent branch and set upstream as part 
 
 ```bash
 branch=$(git branch --show-current)
-git push -u origin HEAD:agent/my-agent/$branch
+git push -u origin HEAD:agents/my-agent/$branch
 ```
 
 After this, plain `git pull` uses the proxy. The old direct remote is still available as `upstream` for inspection or manual fetches. If you do not want to keep it, remove it:

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <allow-branch-globs> [deny-branch-globs]" >&2
+  echo "Usage: $0 <repo-name> <origin-url> <agent-id> <agent-public-key-file> <push-allow-branch-globs> [push-deny-branch-globs] [pull-allow-branch-globs] [pull-deny-branch-globs]" >&2
 }
 
 die() {
@@ -10,7 +10,7 @@ die() {
   exit 1
 }
 
-if [[ $# -lt 5 || $# -gt 6 ]]; then
+if [[ $# -lt 5 || $# -gt 8 ]]; then
   usage
   exit 2
 fi
@@ -19,8 +19,10 @@ REPO_NAME="$1"
 ORIGIN_URL="$2"
 AGENT_ID="$3"
 AGENT_KEY_FILE="$4"
-ALLOW_BRANCH_GLOBS="$5"
-DENY_BRANCH_GLOBS="${6:-}"
+PUSH_ALLOW_BRANCH_GLOBS="$5"
+PUSH_DENY_BRANCH_GLOBS="${6:-}"
+PULL_ALLOW_BRANCH_GLOBS="${7:-*}"
+PULL_DENY_BRANCH_GLOBS="${8:-}"
 
 BASE_DIR="${BASE_DIR:-$HOME/git-proxies}"
 BIN_DIR="${BIN_DIR:-$HOME/bin}"
@@ -56,8 +58,12 @@ if [[ -z "$AGENT_KEY" ]]; then
   die "no public key found in $AGENT_KEY_FILE"
 fi
 
-if [[ -z "$ALLOW_BRANCH_GLOBS" ]]; then
-  die "allow-branch-globs must not be empty; use '*' to allow all branches"
+if [[ -z "$PUSH_ALLOW_BRANCH_GLOBS" ]]; then
+  die "push-allow-branch-globs must not be empty; use '*' to allow all branches"
+fi
+
+if [[ -z "$PULL_ALLOW_BRANCH_GLOBS" ]]; then
+  die "pull-allow-branch-globs must not be empty; use '*' to allow all branches"
 fi
 
 check_origin() {
@@ -164,6 +170,62 @@ fi
 
 export GIT_PROXY_AGENT_ID="$AGENT_ID"
 
+trim_space() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+glob_list_matches() {
+  local value="$1"
+  local glob_list="$2"
+  local glob
+
+  IFS=',' read -r -a globs <<< "$glob_list"
+
+  for glob in "${globs[@]}"; do
+    glob="$(trim_space "$glob")"
+    [[ -z "$glob" ]] && continue
+
+    case "$value" in
+      $glob) return 0 ;;
+    esac
+  done
+
+  return 1
+}
+
+upload_pack_with_policy() {
+  local pull_allow_file="$policy_dir/pull-allow-branch-globs"
+  local pull_deny_file="$policy_dir/pull-deny-branch-globs"
+  local pull_allow_globs="*"
+  local pull_deny_globs=""
+  local branch
+  local hide_args=()
+
+  if [[ -f "$pull_allow_file" ]]; then
+    pull_allow_globs="$(cat "$pull_allow_file")"
+  fi
+
+  if [[ -f "$pull_deny_file" ]]; then
+    pull_deny_globs="$(cat "$pull_deny_file")"
+  fi
+
+  while IFS= read -r branch; do
+    if [[ -n "$pull_deny_globs" ]] && glob_list_matches "$branch" "$pull_deny_globs"; then
+      hide_args+=("-c" "uploadpack.hideRefs=refs/heads/$branch")
+      continue
+    fi
+
+    if ! glob_list_matches "$branch" "$pull_allow_globs"; then
+      hide_args+=("-c" "uploadpack.hideRefs=refs/heads/$branch")
+    fi
+  done < <(git -C "$repo_abs" for-each-ref --format='%(refname:strip=2)' refs/heads)
+
+  exec git "${hide_args[@]}" upload-pack "$repo_abs"
+}
+
 case "$op" in
   git-receive-pack)
     exec git-receive-pack "$repo_abs"
@@ -173,7 +235,7 @@ case "$op" in
     # Best-effort refresh so pulls/fetches see latest upstream branches.
     # If origin is unavailable, still allow serving the local bare repo.
     git -C "$repo_abs" fetch origin '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || true
-    exec git-upload-pack "$repo_abs"
+    upload_pack_with_policy
     ;;
 
   *)
@@ -218,8 +280,14 @@ SYNCED_BRANCHES="$(git -C "$REPO_DIR" for-each-ref --format='%(refname:short)' r
 # 3. Install/update per-repo, per-agent policy.
 # --------------------------------------------------------------------
 mkdir -p "$REPO_DIR/proxy-policy/agents/$AGENT_ID"
-printf '%s\n' "$ALLOW_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-branch-globs"
-printf '%s\n' "$DENY_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-branch-globs"
+printf '%s\n' "$PUSH_ALLOW_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/push-allow-branch-globs"
+printf '%s\n' "$PUSH_DENY_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/push-deny-branch-globs"
+printf '%s\n' "$PULL_ALLOW_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/pull-allow-branch-globs"
+printf '%s\n' "$PULL_DENY_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/pull-deny-branch-globs"
+
+# Backward-compatible copies for older generated hooks and local inspection.
+printf '%s\n' "$PUSH_ALLOW_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-branch-globs"
+printf '%s\n' "$PUSH_DENY_BRANCH_GLOBS" > "$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-branch-globs"
 
 # --------------------------------------------------------------------
 # 4. Install/update pre-receive hook.
@@ -236,8 +304,10 @@ if [[ -z "$AGENT_ID" ]]; then
 fi
 
 REPO_DIR="$(pwd)"
-ALLOW_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-branch-globs"
-DENY_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-branch-globs"
+PUSH_ALLOW_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/push-allow-branch-globs"
+PUSH_DENY_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/push-deny-branch-globs"
+LEGACY_ALLOW_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-branch-globs"
+LEGACY_DENY_GLOBS_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-branch-globs"
 LEGACY_ALLOW_REGEX_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/allow-ref-regex"
 LEGACY_DENY_REGEX_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/deny-ref-regex"
 LEGACY_REF_REGEX_FILE="$REPO_DIR/proxy-policy/agents/$AGENT_ID/ref-regex"
@@ -269,16 +339,22 @@ glob_list_matches() {
 }
 
 POLICY_MODE="glob"
-ALLOW_BRANCH_GLOBS=""
-DENY_BRANCH_GLOBS=""
+PUSH_ALLOW_BRANCH_GLOBS=""
+PUSH_DENY_BRANCH_GLOBS=""
 ALLOW_REF_REGEX=""
 DENY_REF_REGEX=""
 
-if [[ -f "$ALLOW_GLOBS_FILE" ]]; then
-  ALLOW_BRANCH_GLOBS="$(cat "$ALLOW_GLOBS_FILE")"
+if [[ -f "$PUSH_ALLOW_GLOBS_FILE" ]]; then
+  PUSH_ALLOW_BRANCH_GLOBS="$(cat "$PUSH_ALLOW_GLOBS_FILE")"
 
-  if [[ -f "$DENY_GLOBS_FILE" ]]; then
-    DENY_BRANCH_GLOBS="$(cat "$DENY_GLOBS_FILE")"
+  if [[ -f "$PUSH_DENY_GLOBS_FILE" ]]; then
+    PUSH_DENY_BRANCH_GLOBS="$(cat "$PUSH_DENY_GLOBS_FILE")"
+  fi
+elif [[ -f "$LEGACY_ALLOW_GLOBS_FILE" ]]; then
+  PUSH_ALLOW_BRANCH_GLOBS="$(cat "$LEGACY_ALLOW_GLOBS_FILE")"
+
+  if [[ -f "$LEGACY_DENY_GLOBS_FILE" ]]; then
+    PUSH_DENY_BRANCH_GLOBS="$(cat "$LEGACY_DENY_GLOBS_FILE")"
   fi
 elif [[ -f "$LEGACY_ALLOW_REGEX_FILE" || -f "$LEGACY_REF_REGEX_FILE" ]]; then
   POLICY_MODE="regex"
@@ -310,15 +386,15 @@ while read -r old new ref; do
   esac
 
   if [[ "$POLICY_MODE" == "glob" ]]; then
-    if [[ -n "$DENY_BRANCH_GLOBS" ]] && glob_list_matches "$branch" "$DENY_BRANCH_GLOBS"; then
+    if [[ -n "$PUSH_DENY_BRANCH_GLOBS" ]] && glob_list_matches "$branch" "$PUSH_DENY_BRANCH_GLOBS"; then
       echo "Rejected: agent '$AGENT_ID' may not update denied branch: $branch" >&2
-      echo "Denied branch globs: $DENY_BRANCH_GLOBS" >&2
+      echo "Denied push branch globs: $PUSH_DENY_BRANCH_GLOBS" >&2
       exit 1
     fi
 
-    if ! glob_list_matches "$branch" "$ALLOW_BRANCH_GLOBS"; then
+    if ! glob_list_matches "$branch" "$PUSH_ALLOW_BRANCH_GLOBS"; then
       echo "Rejected: agent '$AGENT_ID' may not update branch: $branch" >&2
-      echo "Allowed branch globs: $ALLOW_BRANCH_GLOBS" >&2
+      echo "Allowed push branch globs: $PUSH_ALLOW_BRANCH_GLOBS" >&2
       exit 1
     fi
   else
@@ -402,7 +478,7 @@ chmod 600 "$AUTHORIZED_KEYS"
 SSH_USER="$(whoami)"
 SSH_HOST="$(detect_host)"
 AGENT_REMOTE_URL="$SSH_USER@$SSH_HOST:$REPO_NAME.git"
-EXAMPLE_BRANCH="agent/$AGENT_ID/my-branch"
+EXAMPLE_BRANCH="agents/$AGENT_ID/my-branch"
 
 echo "Configured Git proxy repo:"
 echo "  $REPO_DIR"
@@ -410,7 +486,7 @@ echo
 echo "Forwarding origin:"
 echo "  $ORIGIN_URL"
 echo
-echo "Branches currently available through proxy:"
+echo "Branches currently synced into proxy:"
 if [[ -n "$SYNCED_BRANCHES" ]]; then
   while IFS= read -r branch; do
     echo "  $branch"
@@ -422,12 +498,20 @@ echo
 echo "Agent:"
 echo "  $AGENT_ID"
 echo
-echo "Allowed pushed branches:"
-echo "  $ALLOW_BRANCH_GLOBS"
-if [[ -n "$DENY_BRANCH_GLOBS" ]]; then
+echo "Allowed pull/clone branches:"
+echo "  $PULL_ALLOW_BRANCH_GLOBS"
+if [[ -n "$PULL_DENY_BRANCH_GLOBS" ]]; then
   echo
-  echo "Denied pushed branches:"
-  echo "  $DENY_BRANCH_GLOBS"
+  echo "Denied pull/clone branches:"
+  echo "  $PULL_DENY_BRANCH_GLOBS"
+fi
+echo
+echo "Allowed push branches:"
+echo "  $PUSH_ALLOW_BRANCH_GLOBS"
+if [[ -n "$PUSH_DENY_BRANCH_GLOBS" ]]; then
+  echo
+  echo "Denied push branches:"
+  echo "  $PUSH_DENY_BRANCH_GLOBS"
 fi
 echo
 echo "SSH endpoint:"
@@ -440,7 +524,7 @@ echo "  $AGENT_REMOTE_URL"
 echo
 echo "Agent clone command:"
 echo "  git clone $AGENT_REMOTE_URL"
-echo "  git clone --branch <branch> $AGENT_REMOTE_URL"
+echo "  git clone --branch <listed-branch> $AGENT_REMOTE_URL"
 echo
 echo "Agent push example:"
 echo "  git push origin HEAD:$EXAMPLE_BRANCH"
@@ -448,4 +532,5 @@ echo
 echo "Notes:"
 echo "  The agent must connect with the private key matching: $AGENT_KEY_FILE"
 echo "  Cloning from the proxy makes it the clone's origin, so normal git pull/fetch behavior works through the proxy."
-echo "  Pushed branch names are checked against the allow/deny branch globs above."
+echo "  Only synced branches allowed by the pull/clone policy can be cloned by name from the proxy."
+echo "  Pull/clone and push branch names are checked against their separate branch globs above."
