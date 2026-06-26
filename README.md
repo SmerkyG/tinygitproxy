@@ -6,7 +6,7 @@
 
 LLM agents often need to hand off code through Git, but they should not be trusted with broad repository credentials. A normal deploy key or user SSH key can let an agent push to arbitrary branches, update protected names by mistake, delete refs, or rewrite history with a force push.
 
-`tinygitproxy` narrows that authority. Agents connect with their own SSH keys, and the proxy only allows branch updates that match the configured policy. It rejects non-branch refs, branch deletion, and non-fast-forward updates before forwarding accepted pushes to origin.
+`tinygitproxy` narrows that authority. Agents connect with their own SSH keys, and the proxy only allows branch updates that match the configured policy. It rejects branch deletion and non-fast-forward branch updates before forwarding accepted pushes to origin. Tags are supported by default, but deleting or moving existing tags is rejected.
 
 ## Setup
 
@@ -38,7 +38,7 @@ bash setup-git-proxy.sh repo-name \
   '*'
 ```
 
-By default, setup verifies that the current SSH user can read the origin with `git ls-remote --heads`. If origin auth is not ready but you still want to install the proxy files, opt in explicitly:
+By default, setup verifies that the current SSH user can read the origin with `git ls-remote --heads --tags`. If origin auth is not ready but you still want to install the proxy files, opt in explicitly:
 
 ```bash
 ALLOW_UNREACHABLE_ORIGIN=1 bash setup-git-proxy.sh ...
@@ -58,11 +58,11 @@ Examples:
 
 ```bash
 # Same repo, two different agents.
-bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git alice-agent ~/alice.pub 'agent/alice-agent/*' '' '*'
-bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git bob-agent ~/bob.pub 'agent/bob-agent/*' '' '*'
+bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git alice-agent ~/alice.pub 'agents/alice-agent/*' '' '*'
+bash setup-git-proxy.sh repo-name git@github.com:ORG/repo-name.git bob-agent ~/bob.pub 'agents/bob-agent/*' '' '*'
 
 # Same agent, another repo.
-bash setup-git-proxy.sh other-repo git@github.com:ORG/other-repo.git alice-agent ~/alice.pub 'agent/alice-agent/*' '' '*'
+bash setup-git-proxy.sh other-repo git@github.com:ORG/other-repo.git alice-agent ~/alice.pub 'agents/alice-agent/*' '' '*'
 ```
 
 For each agent id, setup maintains one marked block in `authorized_keys`. For each repo, it stores policy under:
@@ -92,7 +92,18 @@ main,master                deny exact branches
 release/*,stable           deny release branches and stable
 ```
 
-Deny globs win over allow globs within the same policy. The proxy only accepts branch refs for pushes; tags and other non-branch refs are rejected.
+Deny globs win over allow globs within the same policy.
+
+## Tags
+
+Tags are available by default. Setup syncs tags from origin into the proxy, clones/fetches advertise tags, and agents may create new tags:
+
+```bash
+git tag my-tag
+git push origin my-tag
+```
+
+The proxy rejects tag deletion and moving an existing tag. Other non-branch, non-tag refs are rejected.
 
 ## Cloning Through The Proxy
 
@@ -115,9 +126,9 @@ To clone a specific branch that is listed by setup as available through the prox
 git clone --branch dev git@example-host:repo-name.git
 ```
 
-This makes the proxy the clone's `origin`, so ordinary Git behavior works as expected. `git fetch`, `git pull`, and branch upstream tracking all go through the proxy.
+This makes the proxy the clone's `origin`, so ordinary Git behavior works as expected. `git fetch`, `git pull`, tags, and branch upstream tracking all go through the proxy.
 
-Setup prints the branch names currently synced into the proxy. If a branch exists on the real upstream repository but is not listed by setup or by `git fetch origin` from a proxy clone, the proxy has not seen that branch from its own upstream credentials yet. Rerun setup after confirming the dedicated proxy user can see the branch on origin.
+Setup prints the branch and tag names currently synced into the proxy. If a branch or tag exists on the real upstream repository but is not listed by setup or by `git fetch origin` from a proxy clone, the proxy has not seen that ref from its own upstream credentials yet. Rerun setup after confirming the dedicated proxy user can see it on origin.
 
 If a branch only exists locally in an agent's working clone, publish it to an allowed branch through the proxy:
 
@@ -133,7 +144,7 @@ Push the current commit to an allowed branch name on `origin`:
 git push origin HEAD:agents/my-agent/my-branch
 ```
 
-If the push passes the proxy policy, the proxy forwards that update to the upstream origin configured during setup. In effect, a successful push to the clone's `origin` becomes a push to the real upstream repository, but only after the proxy rejects disallowed branch names, non-branch refs, branch deletion, and non-fast-forward history rewrites.
+If the push passes the proxy policy, the proxy forwards that update to the upstream origin configured during setup. In effect, a successful push to the clone's `origin` becomes a push to the real upstream repository, but only after the proxy rejects disallowed branch names, unsupported refs, branch deletion, tag deletion, tag moves, and non-fast-forward branch rewrites.
 
 If the agent uses a specific private key, configure SSH for the proxy host, for example:
 

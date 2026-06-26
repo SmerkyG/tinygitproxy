@@ -67,7 +67,7 @@ if [[ -z "$PULL_ALLOW_BRANCH_GLOBS" ]]; then
 fi
 
 check_origin() {
-  GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$ORIGIN_URL" >/dev/null
+  GIT_TERMINAL_PROMPT=0 git ls-remote --heads --tags "$ORIGIN_URL" >/dev/null
 }
 
 if ! check_origin; then
@@ -232,9 +232,9 @@ case "$op" in
     ;;
 
   git-upload-pack)
-    # Best-effort refresh so pulls/fetches see latest upstream branches.
+    # Best-effort refresh so pulls/fetches see latest upstream branches and tags.
     # If origin is unavailable, still allow serving the local bare repo.
-    git -C "$repo_abs" fetch origin '+refs/heads/*:refs/heads/*' >/dev/null 2>&1 || true
+    git -C "$repo_abs" fetch origin '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*' >/dev/null 2>&1 || true
     upload_pack_with_policy
     ;;
 
@@ -257,9 +257,9 @@ fi
 git -C "$REPO_DIR" remote remove origin 2>/dev/null || true
 git -C "$REPO_DIR" remote add origin "$ORIGIN_URL"
 
-# Initial sync from origin into local branch refs.
+# Initial sync from origin into local branch and tag refs.
 # This makes pulls from the proxy useful immediately.
-if ! GIT_TERMINAL_PROMPT=0 git -C "$REPO_DIR" fetch origin '+refs/heads/*:refs/heads/*'; then
+if ! GIT_TERMINAL_PROMPT=0 git -C "$REPO_DIR" fetch origin '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'; then
   if [[ "${ALLOW_UNREACHABLE_ORIGIN:-}" == "1" ]]; then
     cat >&2 <<EOF
 Warning: initial fetch from origin failed, so the proxy repo was not synced.
@@ -275,6 +275,7 @@ The proxy was not fully configured. Fix origin access and rerun setup."
 fi
 
 SYNCED_BRANCHES="$(git -C "$REPO_DIR" for-each-ref --format='%(refname:short)' refs/heads)"
+SYNCED_TAGS="$(git -C "$REPO_DIR" for-each-ref --format='%(refname:short)' refs/tags)"
 
 # --------------------------------------------------------------------
 # 3. Install/update per-repo, per-agent policy.
@@ -377,13 +378,32 @@ zero="0000000000000000000000000000000000000000"
 while read -r old new ref; do
   case "$ref" in
     refs/heads/*)
+      ref_type="branch"
       branch="${ref#refs/heads/}"
       ;;
+    refs/tags/*)
+      ref_type="tag"
+      tag="${ref#refs/tags/}"
+      ;;
     *)
-      echo "Rejected: only branch refs are allowed: $ref" >&2
+      echo "Rejected: only branch and tag refs are allowed: $ref" >&2
       exit 1
       ;;
   esac
+
+  if [[ "$ref_type" == "tag" ]]; then
+    if [[ "$new" == "$zero" ]]; then
+      echo "Rejected: tag deletion is not allowed: $tag" >&2
+      exit 1
+    fi
+
+    if [[ "$old" != "$zero" ]]; then
+      echo "Rejected: moving an existing tag is not allowed: $tag" >&2
+      exit 1
+    fi
+
+    continue
+  fi
 
   if [[ "$POLICY_MODE" == "glob" ]]; then
     if [[ -n "$PUSH_DENY_BRANCH_GLOBS" ]] && glob_list_matches "$branch" "$PUSH_DENY_BRANCH_GLOBS"; then
@@ -436,7 +456,7 @@ set -euo pipefail
 
 while read -r old new ref; do
   case "$ref" in
-    refs/heads/*)
+    refs/heads/*|refs/tags/*)
       echo "Forwarding $ref to origin..."
       git push origin "$new:$ref"
       ;;
@@ -495,6 +515,15 @@ else
   echo "  (none)"
 fi
 echo
+echo "Tags currently synced into proxy:"
+if [[ -n "$SYNCED_TAGS" ]]; then
+  while IFS= read -r tag; do
+    echo "  $tag"
+  done <<< "$SYNCED_TAGS"
+else
+  echo "  (none)"
+fi
+echo
 echo "Agent:"
 echo "  $AGENT_ID"
 echo
@@ -528,9 +557,12 @@ echo "  git clone --branch <listed-branch> $AGENT_REMOTE_URL"
 echo
 echo "Agent push example:"
 echo "  git push origin HEAD:$EXAMPLE_BRANCH"
+echo "  git tag my-tag"
+echo "  git push origin my-tag"
 echo
 echo "Notes:"
 echo "  The agent must connect with the private key matching: $AGENT_KEY_FILE"
 echo "  Cloning from the proxy makes it the clone's origin, so normal git pull/fetch behavior works through the proxy."
 echo "  Only synced branches allowed by the pull/clone policy can be cloned by name from the proxy."
+echo "  Tags are visible and creatable by default; deleting or moving existing tags is rejected."
 echo "  Pull/clone and push branch names are checked against their separate branch globs above."
